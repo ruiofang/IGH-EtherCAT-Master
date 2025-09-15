@@ -8,7 +8,6 @@
 |--------|------|------|
 | `deploy_igh_ethercat.sh` | 12K | 主要部署脚本，自动安装和配置EtherCAT Master |
 | `setup_ethercat_network.sh` | 12K | 网卡绑定脚本，配置EtherCAT网络接口 |
-| `quick_start_ethercat.sh` | 8K | 快速启动脚本，一键启动和测试EtherCAT |
 | `diagnose_ethercat.sh` | 16K | 诊断脚本，检查系统状态和排查问题 |
 | `uninstall_igh_ethercat.sh` | 8K | 卸载脚本，完全移除EtherCAT Master |
 | `ethercat.conf.template` | 4K | 配置文件模板，包含详细的配置说明 |
@@ -68,20 +67,10 @@ sudo ./setup_ethercat_network.sh eth0
 sudo ./setup_ethercat_network.sh --list-interfaces
 ```
 
-### 3. 快速启动
 
-```bash
-# 一键启动EtherCAT（推荐）
-sudo ./quick_start_ethercat.sh
-
-# 查看运行状态
-sudo ./quick_start_ethercat.sh --status
-
-# 重新编译内核模块（如有版本不匹配问题）
-sudo ./quick_start_ethercat.sh --rebuild
 ```
 
-### 4. 验证安装
+### 3. 验证安装
 
 ```bash
 # 检查主站状态
