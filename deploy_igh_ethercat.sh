@@ -53,6 +53,106 @@ detect_os() {
     log_info "检测到操作系统: $OS $VER"
 }
 
+# 选择网卡
+select_network_interface() {
+    log_info "正在检测可用的网卡..."
+    
+    # 获取所有网络接口（排除lo和无效接口）
+    local interfaces=()
+    local interface_info=()
+    
+    # 使用ip命令获取网络接口信息
+    while IFS= read -r line; do
+        if [[ $line =~ ^[0-9]+:\ ([^:@]+)[@:]? ]]; then
+            local iface="${BASH_REMATCH[1]}"
+            # 排除lo、docker、veth等虚拟接口
+            if [[ ! "$iface" =~ ^(lo|docker|br-|veth|virbr) ]]; then
+                interfaces+=("$iface")
+                
+                # 获取接口详细信息
+                local ip_addr=$(ip addr show "$iface" 2>/dev/null | grep -o "inet [0-9.]*" | cut -d' ' -f2 | head -1)
+                local link_status=$(ip link show "$iface" 2>/dev/null | grep -o "state [A-Z]*" | cut -d' ' -f2)
+                local speed=""
+                
+                # 尝试获取网卡速度信息
+                if command -v ethtool >/dev/null 2>&1; then
+                    speed=$(ethtool "$iface" 2>/dev/null | grep "Speed:" | cut -d: -f2 | xargs)
+                fi
+                
+                local info="$iface"
+                [[ -n "$ip_addr" ]] && info+=" (IP: $ip_addr)"
+                [[ -n "$link_status" ]] && info+=" [状态: $link_status]"
+                [[ -n "$speed" ]] && info+=" [速度: $speed]"
+                
+                interface_info+=("$info")
+            fi
+        fi
+    done < <(ip link show 2>/dev/null)
+    
+    if [[ ${#interfaces[@]} -eq 0 ]]; then
+        log_error "未检测到可用的网络接口"
+        exit 1
+    fi
+    
+    log_success "检测到 ${#interfaces[@]} 个可用网卡"
+    echo ""
+    
+    # 显示网卡列表
+    echo -e "${BLUE}可用的网络接口：${NC}"
+    for i in "${!interface_info[@]}"; do
+        echo "  $((i+1)). ${interface_info[$i]}"
+    done
+    echo ""
+    
+    # 让用户选择
+    local selected_index=""
+    while true; do
+        echo -n -e "${YELLOW}请选择用于EtherCAT的网卡 [1-${#interfaces[@]}]: ${NC}"
+        read -r selected_index
+        
+        # 验证输入
+        if [[ "$selected_index" =~ ^[0-9]+$ ]] && [[ "$selected_index" -ge 1 ]] && [[ "$selected_index" -le ${#interfaces[@]} ]]; then
+            break
+        else
+            log_error "无效选择，请输入 1 到 ${#interfaces[@]} 之间的数字"
+        fi
+    done
+    
+    # 设置选中的网卡
+    SELECTED_INTERFACE="${interfaces[$((selected_index-1))]}"
+    log_success "已选择网卡: $SELECTED_INTERFACE"
+    
+    # 显示警告信息
+    echo ""
+    log_warning "重要提醒："
+    echo "1. 选中的网卡 '$SELECTED_INTERFACE' 将被EtherCAT Master接管"
+    echo "2. 该网卡将无法用于普通的TCP/IP网络通信"
+    echo "3. 请确保该网卡连接到EtherCAT网络，而非普通以太网"
+    echo "4. 如果该网卡当前用于系统网络连接，请先准备备用网络连接"
+    echo ""
+    
+    # 确认选择
+    while true; do
+        echo -n -e "${YELLOW}确认使用网卡 '$SELECTED_INTERFACE' 用于EtherCAT吗？[y/N]: ${NC}"
+        read -r confirm
+        case "$confirm" in
+            [Yy]|[Yy][Ee][Ss])
+                log_success "已确认选择网卡: $SELECTED_INTERFACE"
+                break
+                ;;
+            [Nn]|[Nn][Oo]|"")
+                log_info "取消安装，请重新运行脚本选择其他网卡"
+                exit 0
+                ;;
+            *)
+                log_error "请输入 y 或 n"
+                ;;
+        esac
+    done
+    
+    echo ""
+}
+
 # 安装依赖包
 install_dependencies() {
     log_info "正在安装系统依赖包..."
@@ -304,47 +404,63 @@ configure_ethercat() {
         log_info "在脚本目录找到配置模板: $template_file"
     fi
     
-    # 如果找到模板文件，基于模板创建配置
+        # 如果找到模板文件，基于模板创建配置
     if [[ -n "$template_file" ]]; then
         log_info "使用模板文件创建配置..."
         
-        # 从模板创建配置，提取关键配置项
+        # 从模板创建配置，并替换网卡设置
         {
             echo "# EtherCAT Master配置文件"
             echo "# 基于模板文件生成: $(basename "$template_file")"
             echo "# 生成时间: $(date)"
+            echo "# 用户选择的网卡: $SELECTED_INTERFACE"
             echo ""
             
-            # 从模板中提取配置行（去掉注释行，但保留重要的注释）
-            grep -E "^(MASTER[0-9]_DEVICE|MASTER[0-9]_BACKUP|DEVICE_MODULES|ETHERCAT_OPTIONS|ETHERCAT_USER|ETHERCAT_GROUP)=" "$template_file" 2>/dev/null || {
-                # 如果模板中没有这些配置，使用默认值
+            # 从模板中提取配置行，但替换MASTER0_DEVICE
+            while IFS= read -r line; do
+                if [[ $line =~ ^MASTER0_DEVICE= ]]; then
+                    echo "MASTER0_DEVICE=\"$SELECTED_INTERFACE\"  # 用户选择的网卡"
+                elif [[ $line =~ ^(MASTER[0-9]_BACKUP|DEVICE_MODULES|ETHERCAT_OPTIONS|ETHERCAT_USER|ETHERCAT_GROUP)= ]]; then
+                    echo "$line"
+                fi
+            done < "$template_file"
+            
+            # 如果模板中没有必要的配置，添加默认值
+            if ! grep -q "^MASTER0_DEVICE=" "$template_file" 2>/dev/null; then
                 echo "# 主设备配置"
-                echo "MASTER0_DEVICE=\"eth0\"  # 请根据实际网卡名称修改"
+                echo "MASTER0_DEVICE=\"$SELECTED_INTERFACE\"  # 用户选择的网卡"
                 echo "MASTER0_BACKUP=\"\""
+            fi
+            if ! grep -q "^DEVICE_MODULES=" "$template_file" 2>/dev/null; then
                 echo ""
                 echo "# 设备模块"
                 echo "DEVICE_MODULES=\"generic\""
+            fi
+            if ! grep -q "^ETHERCAT_OPTIONS=" "$template_file" 2>/dev/null; then
                 echo ""
                 echo "# 运行参数"
                 echo "ETHERCAT_OPTIONS=\"\""
+            fi
+            if ! grep -q "^ETHERCAT_USER=" "$template_file" 2>/dev/null; then
                 echo ""
                 echo "# 用户和组"
                 echo "ETHERCAT_USER=\"ethercat\""
                 echo "ETHERCAT_GROUP=\"ethercat\""
-            }
+            fi
         } > "$config_file"
         
         log_success "基于模板创建配置文件完成"
     else
         log_info "未找到配置模板，使用默认配置..."
         
-        # 创建默认配置文件
+        # 创建默认配置文件，使用用户选择的网卡
         cat > "$config_file" << EOF
 # EtherCAT Master配置文件
 # 生成时间: $(date)
+# 用户选择的网卡: $SELECTED_INTERFACE
 #
 # 主设备配置
-MASTER0_DEVICE="eth0"  # 请根据实际网卡名称修改
+MASTER0_DEVICE="$SELECTED_INTERFACE"  # 用户选择的网卡
 MASTER0_BACKUP=""
 
 # 设备模块
@@ -359,9 +475,7 @@ ETHERCAT_GROUP="ethercat"
 EOF
         
         log_success "默认配置文件创建完成"
-    fi
-
-    # 创建到系统配置目录的符号链接（为了兼容性）
+    fi    # 创建到系统配置目录的符号链接（为了兼容性）
     ln -sf /opt/etherlab/etc/sysconfig/ethercat /etc/sysconfig/ethercat
     
     log_success "EtherCAT参数配置完成"
@@ -395,14 +509,41 @@ create_user() {
 set_permissions() {
     log_info "正在设置文件权限..."
     
+    local current_dir=$(pwd)
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local rules_file=""
+    local target_rules="/etc/udev/rules.d/99-ethercat.rules"
+    
+    # 检查是否存在本地udev规则文件
+    if [[ -f "$current_dir/99-ethercat.rules" ]]; then
+        rules_file="$current_dir/99-ethercat.rules"
+        log_info "在当前目录找到udev规则文件: $rules_file"
+    elif [[ -f "$script_dir/99-ethercat.rules" ]]; then
+        rules_file="$script_dir/99-ethercat.rules"
+        log_info "在脚本目录找到udev规则文件: $rules_file"
+    fi
+    
     # 设置udev规则
-    cat > /etc/udev/rules.d/99-ethercat.rules << EOF
+    if [[ -n "$rules_file" ]]; then
+        log_info "使用现有的udev规则文件..."
+        cp "$rules_file" "$target_rules"
+        chmod 644 "$target_rules"
+        chown root:root "$target_rules"
+        log_success "已复制并设置udev规则文件权限"
+    else
+        log_info "未找到现有规则文件，创建默认udev规则..."
+        cat > "$target_rules" << EOF
 # EtherCAT Master设备权限规则
 KERNEL=="EtherCAT[0-9]*", MODE="0664", GROUP="ethercat"
 EOF
+        chmod 644 "$target_rules"
+        chown root:root "$target_rules"
+        log_success "已创建默认udev规则文件"
+    fi
     
     # 重新加载udev规则
     udevadm control --reload-rules
+    log_info "已重新加载udev规则"
     
     # 设置目录权限
     chown -R root:ethercat /opt/etherlab
@@ -440,9 +581,10 @@ show_post_install_info() {
     log_info "配置文件: /opt/etherlab/etc/sysconfig/ethercat"
     log_info "服务文件: /etc/systemd/system/ethercat.service"
     log_info "初始化脚本: /etc/init.d/ethercat"
+    log_info "EtherCAT网卡: $SELECTED_INTERFACE"
     echo ""
     log_warning "重要提醒："
-    echo "1. 请编辑 /opt/etherlab/etc/sysconfig/ethercat 配置正确的网卡名称"
+    echo "1. EtherCAT网卡已配置为: $SELECTED_INTERFACE"
     echo "2. 根据需要修改 /etc/modprobe.d/ethercat.conf 禁用相应的网络驱动"
     echo "3. 重启系统或手动加载内核模块"
     echo "4. 使用 'systemctl start ethercat' 启动服务"
@@ -463,6 +605,7 @@ main() {
     
     check_root
     detect_os
+    select_network_interface
     install_dependencies
     download_source
     configure_and_build
