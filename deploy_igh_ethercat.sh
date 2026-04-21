@@ -261,7 +261,7 @@ install_dependencies() {
 # 下载IGH EtherCAT Master源码
 download_source() {
     local download_dir="/usr/src/ethercat"
-    local version="1.6.7"
+    local version="1.6.9"
     local url="https://gitlab.com/etherlab.org/ethercat.git"
     local max_retries=3
     local retry_count=0

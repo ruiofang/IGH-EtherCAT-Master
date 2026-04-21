@@ -30,7 +30,7 @@
 sudo ./deploy_igh_ethercat.sh
 ```
 
-**注意**: 脚本会自动从 `https://gitlab.com/etherlab.org/ethercat.git` 下载最新的IGH EtherCAT Master 1.6.7版本源码。
+**注意**: 脚本会自动从 `https://gitlab.com/etherlab.org/ethercat.git` 下载IGH EtherCAT Master 1.6.9版本源码。
 
 ### 3. 配置网络接口
 
@@ -462,6 +462,14 @@ watch -n 1 'cat /proc/interrupts | grep eth0'
 ## 🤝 贡献
 
 欢迎提交问题报告和改进建议！请通过GitHub Issues或Pull Requests参与贡献。
+
+## 🙏 致谢
+
+本工具包基于 [IgH EtherCAT Master](https://gitlab.com/etherlab.org/ethercat) 开源项目构建，衷心感谢原作者 **Dr.-Ing. Wilhelm Hagemeister**、**Dr.-Ing. Florian Pose** 以及 EtherLab.org 社区长期维护与贡献，使 EtherCAT 主站在 Linux 平台上得以稳定运行。
+
+- 上游仓库: https://gitlab.com/etherlab.org/ethercat
+- 项目主页: https://etherlab.org/
+- 许可协议: GNU GPL v2（上游 IgH EtherCAT Master 的许可，请在使用时遵守）
 
 ---
 
