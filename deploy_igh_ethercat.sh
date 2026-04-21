@@ -53,6 +53,66 @@ detect_os() {
     log_info "检测到操作系统: $OS $VER"
 }
 
+is_supported_ethercat_interface() {
+    local iface="$1"
+    local type_file="/sys/class/net/$iface/type"
+
+    if [[ ! -r "$type_file" ]]; then
+        return 1
+    fi
+
+    if [[ "$(cat "$type_file")" != "1" ]]; then
+        return 1
+    fi
+
+    if [[ -d "/sys/class/net/$iface/wireless" ]] || [[ -d "/sys/class/net/$iface/bridge" ]]; then
+        return 1
+    fi
+
+    if [[ "$iface" =~ ^(lo|docker|br-|veth|virbr|wl|ww|can|l4tbr|usb[0-9]+) ]]; then
+        return 1
+    fi
+
+    if [[ ! "$iface" =~ ^(en|eth) ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+ensure_kernel_headers() {
+    local kernel_release
+    local header_candidates=()
+
+    kernel_release="$(uname -r)"
+
+    if [[ -d "/lib/modules/$kernel_release/build" ]]; then
+        log_info "检测到现有内核头文件目录: /lib/modules/$kernel_release/build"
+        return 0
+    fi
+
+    header_candidates+=("linux-headers-$kernel_release")
+
+    if [[ "$kernel_release" == *"tegra"* ]]; then
+        header_candidates=("nvidia-l4t-kernel-headers" "${header_candidates[@]}")
+    fi
+
+    for package_name in "${header_candidates[@]}"; do
+        if apt-cache show "$package_name" >/dev/null 2>&1; then
+            log_info "正在安装内核头文件包: $package_name"
+            if apt-get install -y "$package_name"; then
+                if [[ -d "/lib/modules/$kernel_release/build" ]]; then
+                    log_success "内核头文件安装完成"
+                    return 0
+                fi
+            fi
+        fi
+    done
+
+    log_error "未找到与当前内核 $kernel_release 匹配的可用头文件。请先确认 Jetson 内核头文件已安装。"
+    exit 1
+}
+
 # 选择网卡
 select_network_interface() {
     log_info "正在检测可用的网卡..."
@@ -65,8 +125,7 @@ select_network_interface() {
     while IFS= read -r line; do
         if [[ $line =~ ^[0-9]+:\ ([^:@]+)[@:]? ]]; then
             local iface="${BASH_REMATCH[1]}"
-            # 排除lo、docker、veth等虚拟接口
-            if [[ ! "$iface" =~ ^(lo|docker|br-|veth|virbr) ]]; then
+            if is_supported_ethercat_interface "$iface"; then
                 interfaces+=("$iface")
                 
                 # 获取接口详细信息
@@ -162,8 +221,8 @@ install_dependencies() {
             apt-get update
             apt-get install -y \
                 build-essential \
-                linux-headers-$(uname -r) \
                 autoconf \
+                automake \
                 libtool \
                 pkg-config \
                 make \
@@ -172,6 +231,7 @@ install_dependencies() {
                 dkms \
                 ethtool \
                 net-tools
+            ensure_kernel_headers
             ;;
         *"CentOS"*|*"Red Hat"*|*"Rocky"*|*"AlmaLinux"*)
             yum groupinstall -y "Development Tools"
@@ -179,6 +239,7 @@ install_dependencies() {
                 kernel-devel \
                 kernel-headers \
                 autoconf \
+                automake \
                 libtool \
                 pkgconfig \
                 make \
@@ -290,6 +351,9 @@ download_source() {
 # 配置和编译
 configure_and_build() {
     local build_dir="/usr/src/ethercat"
+    local cpu_count
+
+    cpu_count="$(nproc)"
     
     log_info "正在配置和编译EtherCAT Master..."
     
@@ -306,7 +370,6 @@ configure_and_build() {
         --disable-8139too \
         --enable-generic \
         --enable-hrtimer \
-        --enable-cycles \
         --with-linux-dir=/lib/modules/$(uname -r)/build \
         --enable-userlib \
         --enable-tool \
@@ -314,7 +377,8 @@ configure_and_build() {
     
     # 编译
     make clean
-    make -j$(nproc)
+    make -j"$cpu_count"
+    make -j"$cpu_count" modules
     
     log_success "编译完成"
 }
@@ -322,6 +386,9 @@ configure_and_build() {
 # 安装EtherCAT Master
 install_ethercat() {
     local build_dir="/usr/src/ethercat"
+    local kernel_release
+
+    kernel_release="$(uname -r)"
     
     log_info "正在安装EtherCAT Master..."
     
@@ -329,6 +396,8 @@ install_ethercat() {
     
     # 安装
     make install
+    make modules_install
+    depmod "$kernel_release"
     
     # 创建符号链接
     ln -sf /opt/etherlab/bin/ethercat /usr/local/bin/ethercat
