@@ -56,25 +56,9 @@ detect_os() {
 
 is_supported_ethercat_interface() {
     local iface="$1"
-    local type_file="/sys/class/net/$iface/type"
 
-    if [[ ! -r "$type_file" ]]; then
-        return 1
-    fi
-
-    if [[ "$(cat "$type_file")" != "1" ]]; then
-        return 1
-    fi
-
-    if [[ -d "/sys/class/net/$iface/wireless" ]] || [[ -d "/sys/class/net/$iface/bridge" ]]; then
-        return 1
-    fi
-
-    if [[ "$iface" =~ ^(lo|docker|br-|veth|virbr|wl|ww|can|l4tbr|usb[0-9]+) ]]; then
-        return 1
-    fi
-
-    if [[ ! "$iface" =~ ^(en|eth) ]]; then
+    # 仅排除本地回环接口，其它接口一律列出由用户自行判断
+    if [[ "$iface" == "lo" ]]; then
         return 1
     fi
 
@@ -118,7 +102,7 @@ ensure_kernel_headers() {
 select_network_interface() {
     log_info "正在检测可用的网卡..."
     
-    # 获取所有网络接口（排除lo和无效接口）
+    # 获取所有网络接口（排除lo）
     local interfaces=()
     local interface_info=()
     
@@ -139,10 +123,29 @@ select_network_interface() {
                     speed=$(ethtool "$iface" 2>/dev/null | grep "Speed:" | cut -d: -f2 | xargs)
                 fi
                 
+                # 判断接口类型，给出推荐提示
+                local hint=""
+                local type_val=""
+                [[ -r "/sys/class/net/$iface/type" ]] && type_val="$(cat "/sys/class/net/$iface/type")"
+                if [[ -d "/sys/class/net/$iface/wireless" ]] || [[ "$iface" =~ ^(wl|ww) ]]; then
+                    hint="${YELLOW}[无线网卡-不推荐]${NC}"
+                elif [[ -d "/sys/class/net/$iface/bridge" ]] || [[ "$iface" =~ ^(docker|br-|virbr) ]]; then
+                    hint="${YELLOW}[桥接/虚拟-不推荐]${NC}"
+                elif [[ "$iface" =~ ^veth ]]; then
+                    hint="${YELLOW}[容器虚拟-不推荐]${NC}"
+                elif [[ "$iface" =~ ^(tailscale|tun|tap|wg) ]]; then
+                    hint="${YELLOW}[VPN/隧道-不推荐]${NC}"
+                elif [[ "$iface" =~ ^enx ]]; then
+                    hint="${GREEN}[USB转以太网-推荐]${NC}"
+                elif [[ "$iface" =~ ^(en|eth) ]] && [[ "$type_val" == "1" ]]; then
+                    hint="${GREEN}[有线以太网-推荐]${NC}"
+                fi
+                
                 local info="$iface"
                 [[ -n "$ip_addr" ]] && info+=" (IP: $ip_addr)"
                 [[ -n "$link_status" ]] && info+=" [状态: $link_status]"
                 [[ -n "$speed" ]] && info+=" [速度: $speed]"
+                [[ -n "$hint" ]] && info+=" $hint"
                 
                 interface_info+=("$info")
             fi
@@ -160,8 +163,11 @@ select_network_interface() {
     # 显示网卡列表
     echo -e "${BLUE}可用的网络接口：${NC}"
     for i in "${!interface_info[@]}"; do
-        echo "  $((i+1)). ${interface_info[$i]}"
+        echo -e "  $((i+1)). ${interface_info[$i]}"
     done
+    echo ""
+    echo -e "${BLUE}提示：${NC}EtherCAT 需要选择独立的${GREEN}有线以太网${NC}接口（推荐标签）；"
+    echo -e "      请勿选择无线、Docker/桥接、veth 容器、VPN 等虚拟接口。"
     echo ""
     
     # 让用户选择
