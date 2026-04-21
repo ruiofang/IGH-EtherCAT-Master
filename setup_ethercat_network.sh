@@ -55,66 +55,123 @@ check_installation() {
     log_success "EtherCAT Master安装检查通过"
 }
 
-# 显示可用的网络接口
-show_network_interfaces() {
-    log_info "可用的网络接口："
-    echo ""
-    
-    # 使用不同的方法获取网络接口信息
-    if command -v ip &> /dev/null; then
-        echo "接口名称         状态      类型        MAC地址"
-        echo "--------         ----      ----        -------"
-        
-        # 获取所有非lo接口
-        ip link show | grep -E "^[0-9]+:" | while IFS= read -r line; do
-            interface=$(echo "$line" | sed -E 's/^[0-9]+: ([^:@]+)[@:]?.*/\1/')
-            
-            if [[ "$interface" != "lo" ]]; then
-                # 获取状态
-                state=$(echo "$line" | grep -o "state [A-Z]*" | cut -d' ' -f2 2>/dev/null || echo "UNKNOWN")
-                
-                # 获取MAC地址 - 需要读取下一行
-                mac_line=$(ip link show "$interface" | grep -o "link/ether [a-f0-9:]\{17\}" | cut -d' ' -f2 2>/dev/null || echo "N/A")
-                
-                # 格式化输出
-                printf "%-16s %-8s %-10s %s\n" "$interface" "$state" "ethernet" "$mac_line"
-            fi
-        done
-    else
-        echo "使用ifconfig显示接口："
-        ifconfig -a | grep -E "^[a-zA-Z0-9]" | grep -v "lo" | while IFS= read -r line; do
-            interface=$(echo "$line" | cut -d' ' -f1 | sed 's/:$//')
-            printf "  %s\n" "$interface"
-        done
+# 获取接口类型提示
+interface_hint() {
+    local iface="$1"
+    local type_val=""
+    [[ -r "/sys/class/net/$iface/type" ]] && type_val="$(cat "/sys/class/net/$iface/type")"
+
+    if [[ -d "/sys/class/net/$iface/wireless" ]] || [[ "$iface" =~ ^(wl|ww) ]]; then
+        echo -e "${YELLOW}[无线-不推荐]${NC}"
+    elif [[ -d "/sys/class/net/$iface/bridge" ]] || [[ "$iface" =~ ^(docker|br-|virbr) ]]; then
+        echo -e "${YELLOW}[桥接/虚拟-不推荐]${NC}"
+    elif [[ "$iface" =~ ^veth ]]; then
+        echo -e "${YELLOW}[容器虚拟-不推荐]${NC}"
+    elif [[ "$iface" =~ ^(tailscale|tun|tap|wg) ]]; then
+        echo -e "${YELLOW}[VPN/隧道-不推荐]${NC}"
+    elif [[ "$iface" =~ ^enx ]]; then
+        echo -e "${GREEN}[USB转以太网-推荐]${NC}"
+    elif [[ "$iface" =~ ^(en|eth) ]] && [[ "$type_val" == "1" ]]; then
+        echo -e "${GREEN}[有线以太网-推荐]${NC}"
     fi
+}
+
+# 判断接口是否是“正在使用的默认路由”
+is_default_gateway_interface() {
+    local iface="$1"
+    local gw_iface
+    gw_iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+    [[ "$gw_iface" == "$iface" ]]
+}
+
+# 收集接口信息到并列数组
+# 结果写入全局数组 INTERFACES / INTERFACE_LABELS
+collect_interfaces() {
+    INTERFACES=()
+    INTERFACE_LABELS=()
+
+    local line iface ip_addr link_state speed carrier hint info
+    while IFS= read -r line; do
+        if [[ $line =~ ^[0-9]+:\ ([^:@]+)[@:]? ]]; then
+            iface="${BASH_REMATCH[1]}"
+            [[ "$iface" == "lo" ]] && continue
+
+            ip_addr=$(ip -o -4 addr show "$iface" 2>/dev/null | awk '{print $4}' | head -1)
+            link_state=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || echo "unknown")
+            carrier=$(cat "/sys/class/net/$iface/carrier" 2>/dev/null || echo "0")
+            speed=""
+            if command -v ethtool >/dev/null 2>&1; then
+                speed=$(ethtool "$iface" 2>/dev/null | awk -F': ' '/Speed:/{print $2; exit}' | xargs)
+            fi
+            hint=$(interface_hint "$iface")
+
+            info="$iface"
+            [[ -n "$ip_addr" ]]    && info+=" (IP: $ip_addr)"
+            [[ -n "$link_state" ]] && info+=" [状态: $link_state]"
+            [[ "$carrier" == "1" ]] && info+=" [连接: 已插线]" || info+=" [连接: 无载波]"
+            [[ -n "$speed" ]]      && info+=" [速度: $speed]"
+            [[ -n "$hint" ]]       && info+=" $hint"
+
+            INTERFACES+=("$iface")
+            INTERFACE_LABELS+=("$info")
+        fi
+    done < <(ip link show 2>/dev/null)
+}
+
+# 仅显示接口列表（供 --list 使用）
+show_network_interfaces() {
+    collect_interfaces
+    echo ""
+    echo -e "${BLUE}当前网络接口:${NC}"
+    local i
+    for i in "${!INTERFACES[@]}"; do
+        echo -e "  $((i+1)). ${INTERFACE_LABELS[$i]}"
+    done
     echo ""
 }
 
-# 交互式选择网卡
+# 交互式选择网卡（通过编号选择，带警告）
 select_interface() {
-    local selected_interface=""
-    
-    while [[ -z "$selected_interface" ]]; do
-        show_network_interfaces >&2  # 重定向到stderr，避免混入返回值
-        
-        echo -n "请输入要绑定到EtherCAT的网卡名称 (例如: eth0, enp2s0): " >&2
-        read -r interface_name
-        
-        if [[ -z "$interface_name" ]]; then
-            log_warning "请输入有效的网卡名称" >&2
-            continue
+    collect_interfaces
+
+    if [[ ${#INTERFACES[@]} -eq 0 ]]; then
+        log_error "未检测到任何网络接口" >&2
+        exit 1
+    fi
+
+    {
+        echo ""
+        echo -e "${BLUE}可用的网络接口:${NC}"
+        local i
+        for i in "${!INTERFACES[@]}"; do
+            echo -e "  $((i+1)). ${INTERFACE_LABELS[$i]}"
+        done
+        echo ""
+        echo -e "${BLUE}提示：${NC}请选择带${GREEN}[推荐]${NC}标签的有线以太网；避免选择无线/容器/VPN 虚拟接口。"
+        echo ""
+    } >&2
+
+    local idx selected
+    while true; do
+        echo -n -e "${YELLOW}请选择用于 EtherCAT 的网卡 [1-${#INTERFACES[@]}]: ${NC}" >&2
+        read -r idx
+        if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#INTERFACES[@]} )); then
+            selected="${INTERFACES[$((idx-1))]}"
+            break
         fi
-        
-        # 检查网卡是否存在
-        if ip link show "$interface_name" &>/dev/null; then
-            selected_interface="$interface_name"
-            log_success "选择的网卡: $selected_interface" >&2
-        else
-            log_error "网卡 '$interface_name' 不存在，请重新选择" >&2
-        fi
+        log_error "无效选择" >&2
     done
-    
-    echo "$selected_interface"  # 只返回接口名称
+
+    # 使用中接口警告
+    if is_default_gateway_interface "$selected"; then
+        log_warning "接口 '$selected' 当前是系统的默认网关，绑定后将失去上网能力！" >&2
+        local confirm
+        echo -n -e "${YELLOW}确认继续？[y/N]: ${NC}" >&2
+        read -r confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { log_info "已取消" >&2; exit 0; }
+    fi
+
+    echo "$selected"
 }
 
 # 配置EtherCAT网卡
@@ -201,37 +258,30 @@ rebuild_kernel_modules() {
     log_success "内核模块重新编译完成"
 }
 
-# 加载内核模块
-load_kernel_modules() {
-    log_info "正在加载EtherCAT内核模块..."
-    
-    # 卸载现有模块（如果已加载）
-    local modules=("ec_generic" "ec_master")
-    for module in "${modules[@]}"; do
-        if lsmod | grep -q "^${module}"; then
-            rmmod "$module" 2>/dev/null || log_warning "无法卸载模块: $module"
+# 卸载 EtherCAT 内核模块（让 ethercat 服务带正确的 MAC 参数自己加载）
+unload_kernel_modules() {
+    log_info "卸载已加载的 EtherCAT 内核模块（由服务重新按 MAC 绑定加载）..."
+
+    # 先停服务，避免服务引用模块导致无法卸载
+    if systemctl is-active --quiet ethercat 2>/dev/null; then
+        systemctl stop ethercat 2>/dev/null || true
+    fi
+
+    # 按依赖顺序卸载：先子模块（ec_generic 等），再 ec_master
+    local ec_modules
+    ec_modules=$(lsmod | awk '/^ec_/ {print $1}' || true)
+    if [[ -n "$ec_modules" ]]; then
+        for m in $(echo "$ec_modules" | grep -v '^ec_master$' || true); do
+            rmmod "$m" 2>/dev/null && log_info "  - 已卸载 $m" \
+                || log_warning "  - 无法卸载 $m"
+        done
+        if lsmod | grep -q '^ec_master'; then
+            rmmod ec_master 2>/dev/null && log_info "  - 已卸载 ec_master" \
+                || log_warning "  - 无法卸载 ec_master（可能仍被占用）"
         fi
-    done
-    
-    # 加载主模块
-    if modprobe ec_master; then
-        log_success "EtherCAT主模块加载成功"
     else
-        log_error "EtherCAT主模块加载失败"
-        return 1
+        log_info "当前没有加载 EtherCAT 模块"
     fi
-    
-    # 加载设备模块
-    if modprobe ec_generic; then
-        log_success "EtherCAT通用设备模块加载成功"
-    else
-        log_error "EtherCAT通用设备模块加载失败"
-        return 1
-    fi
-    
-    # 显示已加载的模块
-    log_info "已加载的EtherCAT模块:"
-    lsmod | grep "^ec_" | sed 's/^/  /'
 }
 
 # 启动EtherCAT服务
@@ -241,53 +291,72 @@ start_ethercat_service() {
     # 重新加载systemd配置
     systemctl daemon-reload
     
-    # 启动服务
-    if systemctl start ethercat; then
+    # 启动服务（ethercat 启动脚本会读取 MASTER0_DEVICE 的 MAC，
+    # 并以 'modprobe ec_master main_devices=<MAC>' 的方式加载模块）
+    if systemctl restart ethercat; then
         log_success "EtherCAT服务启动成功"
     else
         log_error "EtherCAT服务启动失败"
         log_info "查看服务状态:"
         systemctl status ethercat --no-pager || true
+        journalctl -u ethercat -n 30 --no-pager || true
         return 1
     fi
     
-    # 检查服务状态
-    sleep 2
+    # 等待服务完全就绪
+    sleep 3
     if systemctl is-active --quiet ethercat; then
         log_success "EtherCAT服务运行正常"
     else
         log_warning "EtherCAT服务状态异常"
+    fi
+
+    # 校验设备文件是否已创建
+    if [[ -c "/dev/EtherCAT0" ]]; then
+        log_success "主站设备文件已创建: /dev/EtherCAT0"
+    else
+        log_warning "未发现 /dev/EtherCAT0，模块可能未正确绑定到网卡 MAC"
+        log_info "检查 modprobe 参数: $(grep -h '^options ec_master' /etc/modprobe.d/*.conf 2>/dev/null || echo '（无）')"
     fi
 }
 
 # 验证EtherCAT功能
 verify_ethercat() {
     log_info "正在验证EtherCAT功能..."
-    
+
+    # 确保 ethercat CLI 可用
+    local ec_bin=""
+    if command -v ethercat >/dev/null 2>&1; then
+        ec_bin="ethercat"
+    elif [[ -x "/opt/etherlab/bin/ethercat" ]]; then
+        ec_bin="/opt/etherlab/bin/ethercat"
+        log_info "使用 $ec_bin（未在 PATH 中）"
+    else
+        log_warning "未找到 ethercat 命令（/opt/etherlab/bin/ethercat 不存在）"
+    fi
+
     # 检查设备文件
     if [[ -c "/dev/EtherCAT0" ]]; then
-        log_success "EtherCAT设备文件存在: /dev/EtherCAT0"
+        log_success "EtherCAT 设备文件存在: /dev/EtherCAT0"
     else
-        log_warning "EtherCAT设备文件不存在: /dev/EtherCAT0"
+        log_warning "EtherCAT 设备文件不存在: /dev/EtherCAT0"
     fi
-    
-    # 测试ethercat命令
+
     sleep 1
-    if ethercat master 2>/dev/null; then
-        log_success "EtherCAT主站通信正常"
+    if [[ -n "$ec_bin" ]] && $ec_bin master >/dev/null 2>&1; then
+        log_success "EtherCAT 主站通信正常"
         echo ""
         log_info "主站状态:"
-        ethercat master | sed 's/^/  /'
-        
+        $ec_bin master | sed 's/^/  /'
         echo ""
         log_info "扫描从站:"
-        ethercat slaves | sed 's/^/  /' || echo "  没有检测到从站设备"
-        
+        $ec_bin slaves 2>/dev/null | sed 's/^/  /' || echo "  （无从站设备）"
     else
-        log_warning "EtherCAT主站通信异常，可能的原因："
-        echo "  1. 网卡还没有EtherCAT设备连接"
-        echo "  2. 需要重启系统以完全加载驱动"
-        echo "  3. 硬件连接问题"
+        log_warning "EtherCAT 主站通信异常，可能的原因："
+        echo "  1. 网卡尚未连接 EtherCAT 从站设备"
+        echo "  2. 链路无载波（未插网线）"
+        echo "  3. 需要重启系统以完全加载驱动"
+        echo "  4. 硬件连接问题"
     fi
 }
 
@@ -437,13 +506,28 @@ main() {
             show_network_interfaces
             exit 1
         fi
+        # 指定网卡：如果它是默认网关，给出严重警告
+        if is_default_gateway_interface "$interface"; then
+            log_warning "接口 '$interface' 当前是默认网关，绑定后将失去上网能力！"
+            echo -n -e "${YELLOW}确认继续？[y/N]: ${NC}"
+            read -r confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { log_info "已取消"; exit 0; }
+        fi
+    fi
+
+    # 检查物理连接
+    local carrier
+    carrier=$(cat "/sys/class/net/$interface/carrier" 2>/dev/null || echo "0")
+    if [[ "$carrier" != "1" ]]; then
+        log_warning "接口 '$interface' 当前未检测到网线连接（carrier=$carrier）"
+        log_warning "EtherCAT 将无法扫描到从站，请确保网线已连接到 EtherCAT 从站设备"
     fi
     
     # 执行配置流程
     configure_ethercat_interface "$interface"
     disable_networkmanager "$interface"
     rebuild_kernel_modules
-    load_kernel_modules
+    unload_kernel_modules
     start_ethercat_service
     verify_ethercat
     show_configuration_summary "$interface"

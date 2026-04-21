@@ -1,6 +1,322 @@
 #!/bin/bash
 
 # 网络接口恢复脚本
+# 用于在 EtherCAT 卸载/停用后恢复网络连接和 NetworkManager 托管
+# 作者: RUIO
+# 版本: 2.1
+
+set -e
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# 日志函数
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
+
+TARGET_INTERFACE=""
+SKIP_DHCP=false
+
+# 帮助信息
+show_help() {
+    cat <<EOF
+网络接口恢复脚本
+
+用法: sudo $0 [选项] [接口名]
+
+选项:
+  -h, --help         显示此帮助
+  -i, --iface NAME   仅恢复指定接口（例如 enx00e04c5f63b8）
+  --skip-dhcp        不主动触发 DHCP 获取 IP
+
+示例:
+  sudo $0                       # 恢复所有以太网接口
+  sudo $0 enp2s0                # 仅恢复 enp2s0
+  sudo $0 -i enx00e04c5f63b8    # 同上（选项形式）
+EOF
+}
+
+# 参数解析
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) show_help; exit 0 ;;
+            -i|--iface) TARGET_INTERFACE="$2"; shift 2 ;;
+            --skip-dhcp) SKIP_DHCP=true; shift ;;
+            -*) log_error "未知选项: $1"; show_help; exit 1 ;;
+            *)  TARGET_INTERFACE="$1"; shift ;;
+        esac
+    done
+}
+
+# 检查 root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "此脚本需要 root 权限，请使用 sudo 执行"
+        exit 1
+    fi
+}
+
+# 停止 EtherCAT 服务并卸载内核模块
+stop_ethercat_stack() {
+    log_info "停止 EtherCAT 服务与内核模块..."
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^ethercat\.service'; then
+        if systemctl is-active --quiet ethercat 2>/dev/null; then
+            systemctl stop ethercat 2>/dev/null || log_warning "停止 ethercat 服务失败"
+            log_info "已停止 ethercat 服务"
+        fi
+    fi
+
+    # 卸载 EtherCAT 相关内核模块（先卸子模块，再卸 ec_master）
+    local ec_modules
+    ec_modules=$(lsmod | awk '/^ec_/ {print $1}' || true)
+    if [[ -n "$ec_modules" ]]; then
+        for m in $(echo "$ec_modules" | grep -v '^ec_master$' || true); do
+            rmmod "$m" 2>/dev/null && log_info "已卸载模块: $m" \
+                || log_warning "无法卸载模块: $m"
+        done
+        if lsmod | grep -q '^ec_master'; then
+            rmmod ec_master 2>/dev/null && log_info "已卸载模块: ec_master" \
+                || log_warning "无法卸载模块: ec_master（可能仍被占用）"
+        fi
+    else
+        log_info "未检测到已加载的 EtherCAT 模块"
+    fi
+}
+
+# 清除 EtherCAT 遗留的 NetworkManager 非托管配置
+clear_nm_unmanaged_config() {
+    local conf="/etc/NetworkManager/conf.d/99-ethercat.conf"
+    if [[ -f "$conf" ]]; then
+        log_info "删除 NetworkManager 非托管配置: $conf"
+        rm -f "$conf"
+    fi
+}
+
+# 重新加载常见网络驱动模块
+reload_network_drivers() {
+    log_info "尝试重新加载常见网络驱动模块..."
+    local modules=(ax88179_178a cdc_ether r8152 r8169 e1000 e1000e igb ixgbe)
+    for m in "${modules[@]}"; do
+        if modinfo "$m" >/dev/null 2>&1; then
+            modprobe "$m" 2>/dev/null && log_info "  + $m" || true
+        fi
+    done
+
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=net 2>/dev/null || true
+    sleep 2
+}
+
+# 获取需要处理的接口列表
+get_target_interfaces() {
+    if [[ -n "$TARGET_INTERFACE" ]]; then
+        if ! ip link show "$TARGET_INTERFACE" &>/dev/null; then
+            log_error "接口不存在: $TARGET_INTERFACE"
+            exit 1
+        fi
+        echo "$TARGET_INTERFACE"
+        return
+    fi
+
+    # 自动识别有线以太网接口（排除虚拟/无线）
+    local iface type_val
+    for iface in /sys/class/net/*; do
+        iface="$(basename "$iface")"
+        [[ "$iface" == "lo" ]] && continue
+        [[ "$iface" =~ ^(docker|br-|veth|virbr|wl|ww|tailscale|tun|tap|wg) ]] && continue
+        [[ -d "/sys/class/net/$iface/wireless" ]] && continue
+        [[ -d "/sys/class/net/$iface/bridge" ]] && continue
+        type_val="$(cat "/sys/class/net/$iface/type" 2>/dev/null || echo)"
+        [[ "$type_val" != "1" ]] && continue
+        echo "$iface"
+    done
+}
+
+# 启用物理链路
+bring_up_interfaces() {
+    local interfaces=("$@")
+    for iface in "${interfaces[@]}"; do
+        local state
+        state=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || echo "unknown")
+        log_info "启用接口 $iface (当前: $state)"
+        ip link set "$iface" up 2>/dev/null \
+            && log_success "接口 $iface 已 up" \
+            || log_warning "接口 $iface 启用失败"
+    done
+    sleep 2
+}
+
+# 重启 NetworkManager
+restart_nm() {
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        log_info "重启 NetworkManager..."
+        systemctl restart NetworkManager
+        sleep 4
+    else
+        log_warning "NetworkManager 未运行（跳过重启）"
+    fi
+}
+
+# 恢复 NetworkManager 托管
+restore_nm_management() {
+    local interfaces=("$@")
+
+    if ! command -v nmcli &>/dev/null; then
+        log_warning "nmcli 不可用，跳过 NetworkManager 托管恢复"
+        return
+    fi
+
+    for iface in "${interfaces[@]}"; do
+        log_info "恢复 $iface 的 NetworkManager 托管..."
+        nmcli device set "$iface" managed yes 2>/dev/null \
+            || log_warning "  设置 managed 失败"
+        sleep 1
+
+        # 查找现有连接（按接口名过滤）
+        local con_name
+        con_name=$(nmcli -g NAME,DEVICE connection show 2>/dev/null \
+                   | awk -F: -v d="$iface" '$2==d {print $1; exit}')
+
+        if [[ -n "$con_name" ]]; then
+            log_info "  找到连接: $con_name，启用自动连接"
+            nmcli connection modify "$con_name" connection.autoconnect yes 2>/dev/null || true
+            nmcli connection up "$con_name" 2>/dev/null \
+                && log_success "  已激活连接 $con_name" \
+                || log_warning "  连接 $con_name 激活失败（可能未插网线）"
+        else
+            log_info "  无现有连接，创建 DHCP 以太网连接"
+            nmcli connection add type ethernet ifname "$iface" con-name "$iface" \
+                autoconnect yes 2>/dev/null \
+                && log_success "  已创建连接 $iface" \
+                || log_warning "  创建连接失败"
+            nmcli connection up "$iface" 2>/dev/null || true
+        fi
+    done
+    sleep 3
+}
+
+# 若 NetworkManager 不可用，手动触发 DHCP
+fallback_dhcp() {
+    local interfaces=("$@")
+    [[ "$SKIP_DHCP" == true ]] && return
+    if command -v nmcli &>/dev/null && systemctl is-active --quiet NetworkManager; then
+        return
+    fi
+
+    log_info "NetworkManager 不可用，尝试通过 dhclient 获取 IP..."
+    for iface in "${interfaces[@]}"; do
+        if command -v dhclient &>/dev/null; then
+            dhclient -r "$iface" 2>/dev/null || true
+            dhclient "$iface" 2>/dev/null \
+                && log_success "  $iface 已获取 DHCP 地址" \
+                || log_warning "  $iface DHCP 失败"
+        elif command -v dhcpcd &>/dev/null; then
+            dhcpcd "$iface" 2>/dev/null || true
+        fi
+    done
+}
+
+# 显示结果
+show_network_status() {
+    echo ""
+    log_info "====== 恢复后网络状态 ======"
+    echo ""
+
+    if command -v nmcli &>/dev/null; then
+        echo -e "${BLUE}NetworkManager 设备状态:${NC}"
+        nmcli device status | sed 's/^/  /'
+        echo ""
+    fi
+
+    echo -e "${BLUE}接口与 IP:${NC}"
+    ip -brief addr show | sed 's/^/  /'
+    echo ""
+
+    echo -e "${BLUE}默认路由:${NC}"
+    ip route show default | sed 's/^/  /' || echo "  （无默认路由）"
+    echo ""
+
+    echo -e "${BLUE}连通性测试:${NC}"
+    if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+        log_success "  外网可达 (ping 1.1.1.1 OK)"
+    else
+        log_warning "  外网不可达，请检查网线/路由/DNS"
+    fi
+}
+
+# 手动恢复指引
+show_manual_instructions() {
+    cat <<'EOF'
+
+如果自动恢复未完全成功，可手动执行：
+
+  # 删除 EtherCAT 遗留的 NM 非托管配置
+  sudo rm -f /etc/NetworkManager/conf.d/99-ethercat.conf
+  sudo systemctl restart NetworkManager
+
+  # 启用接口
+  sudo ip link set <iface> up
+  sudo nmcli device set <iface> managed yes
+  sudo nmcli connection up <iface>     # 或创建新连接：
+  sudo nmcli connection add type ethernet ifname <iface> con-name <iface> autoconnect yes
+
+  # 手动 DHCP
+  sudo dhclient <iface>
+
+EOF
+}
+
+main() {
+    parse_args "$@"
+    check_root
+
+    echo ""
+    log_info "========================================="
+    log_info "  网络接口恢复脚本 v2.1"
+    log_info "========================================="
+    echo ""
+
+    stop_ethercat_stack
+    clear_nm_unmanaged_config
+    reload_network_drivers
+
+    local interfaces=()
+    mapfile -t interfaces < <(get_target_interfaces)
+
+    if [[ ${#interfaces[@]} -eq 0 ]]; then
+        log_error "未找到任何以太网接口"
+        show_manual_instructions
+        exit 1
+    fi
+
+    log_success "待恢复接口: ${interfaces[*]}"
+    bring_up_interfaces "${interfaces[@]}"
+    restart_nm
+    restore_nm_management "${interfaces[@]}"
+    fallback_dhcp "${interfaces[@]}"
+    show_network_status
+
+    echo ""
+    log_success "========================================="
+    log_success "  网络恢复流程结束"
+    log_success "========================================="
+    show_manual_instructions
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
+#!/bin/bash
+
+# 网络接口恢复脚本
 # 用于在EtherCAT卸载后恢复网络连接和NetworkManager托管
 # 作者: RUIO
 # 日期: 2025-09-17
