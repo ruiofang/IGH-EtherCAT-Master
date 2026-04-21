@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # IGH EtherCAT Master 1.6 自动部署脚本
-# 作者: GitHub Copilot
+# 作者: RUIO
+# 许可协议: MIT
 # 日期: 2025-09-06
 # 版本: 1.0
 
