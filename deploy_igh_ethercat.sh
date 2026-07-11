@@ -435,17 +435,28 @@ configure_kernel_module() {
 # 请根据您的网卡型号取消相应行的注释
 EOF
     
+    # 为指定网卡生成 systemd 服务。不能只依赖 network.target：USB 网卡等
+    # 设备常在该 target 之后才完成枚举，导致首次启动时找不到接口。
+    local device_unit
+    device_unit="$(systemd-escape -p --suffix=device "/sys/class/net/$SELECTED_INTERFACE")"
+
     # 创建systemd服务文件
     cat > /etc/systemd/system/ethercat.service << EOF
 [Unit]
 Description=EtherCAT Master Service
-After=network.target
+Wants=network-online.target
+After=network-online.target $device_unit
+BindsTo=$device_unit
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
+ExecStartPre=/usr/bin/test -e /sys/class/net/$SELECTED_INTERFACE
 ExecStart=/etc/init.d/ethercat start
 ExecStop=/etc/init.d/ethercat stop
 RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -454,6 +465,8 @@ EOF
     # 复制初始化脚本
     cp /opt/etherlab/etc/init.d/ethercat /etc/init.d/
     chmod +x /etc/init.d/ethercat
+
+    systemctl daemon-reload
     
     log_success "内核模块配置完成"
 }
@@ -610,7 +623,7 @@ set_permissions() {
         log_info "未找到现有规则文件，创建默认udev规则..."
         cat > "$target_rules" << EOF
 # EtherCAT Master设备权限规则
-KERNEL=="EtherCAT[0-9]*", MODE="0664", GROUP="ethercat"
+KERNEL=="EtherCAT[0-9]*", MODE="0666", GROUP="ethercat"
 EOF
         chmod 644 "$target_rules"
         chown root:root "$target_rules"

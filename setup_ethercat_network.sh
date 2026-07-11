@@ -212,21 +212,59 @@ configure_ethercat_interface() {
     fi
 }
 
+# 让服务在目标网卡实际出现在 /sys/class/net 后再启动。
+# 特别是 USB 网卡在 network.target 之后才枚举时，旧服务会在开机时失败，
+# 此处的失败重试可在网卡出现后自动创建 EtherCAT0。
+configure_systemd_service_for_interface() {
+    local interface="$1"
+    local device_unit
+
+    device_unit="$(systemd-escape -p --suffix=device "/sys/class/net/$interface")"
+    log_info "正在配置开机网卡等待和自动重试..."
+
+    cat > /etc/systemd/system/ethercat.service << EOF
+[Unit]
+Description=EtherCAT Master Service
+Wants=network-online.target
+After=network-online.target $device_unit
+BindsTo=$device_unit
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/test -e /sys/class/net/$interface
+ExecStart=/etc/init.d/ethercat start
+ExecStop=/etc/init.d/ethercat stop
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable ethercat.service >/dev/null
+    log_success "已设置服务等待网卡 $interface；网卡延迟出现时每 5 秒自动重试"
+}
+
 # 停止NetworkManager对指定网卡的管理
 disable_networkmanager() {
     local interface="$1"
     
+    # 无论 NetworkManager 当前是否已运行，都写入持久化配置，确保重启后不会
+    # 抢占 EtherCAT 专用接口。
+    mkdir -p /etc/NetworkManager/conf.d
+    cat > /etc/NetworkManager/conf.d/99-ethercat.conf << EOF
+[keyfile]
+unmanaged-devices=interface-name:$interface
+EOF
+
     if systemctl is-active --quiet NetworkManager 2>/dev/null; then
         log_info "检测到NetworkManager，正在禁用对 $interface 的管理..."
         
         # 设置网卡为非托管状态
         nmcli device set "$interface" managed no 2>/dev/null || true
-        
-        # 创建NetworkManager配置文件
-        cat > /etc/NetworkManager/conf.d/99-ethercat.conf << EOF
-[keyfile]
-unmanaged-devices=interface-name:$interface
-EOF
         
         # 重新加载NetworkManager配置
         systemctl reload NetworkManager 2>/dev/null || true
@@ -396,12 +434,14 @@ show_help() {
     echo "  -l, --list        仅显示可用网络接口"
     echo "  -r, --rebuild     重新编译内核模块"
     echo "  -s, --status      显示当前状态"
+    echo "  --install-boot-fix 安装开机自动绑定修复（无需网卡当前在线）"
     echo ""
     echo "示例:"
     echo "  $0                    # 交互式选择网卡"
     echo "  $0 eth0              # 直接绑定eth0网卡"
     echo "  $0 --list            # 显示可用网卡"
     echo "  $0 --rebuild         # 重新编译模块"
+    echo "  $0 --install-boot-fix # 修复已部署系统的开机自动绑定"
     echo ""
 }
 
@@ -446,6 +486,7 @@ main() {
     local rebuild_only=false
     local list_only=false
     local status_only=false
+    local install_boot_fix_only=false
     
     # 解析命令行参数
     while [[ $# -gt 0 ]]; do
@@ -466,6 +507,10 @@ main() {
                 show_status
                 exit 0
                 ;;
+            --install-boot-fix)
+                install_boot_fix_only=true
+                shift
+                ;;
             -*)
                 log_error "未知选项: $1"
                 show_help
@@ -484,6 +529,21 @@ main() {
     
     check_root
     check_installation
+
+    # 从现有配置读取接口名称。此模式不要求 USB 网卡已经被系统枚举，
+    # 因而可用于修复“开机过早启动导致接口不存在”的系统。
+    if [[ "$install_boot_fix_only" == true ]]; then
+        interface=$(sed -n 's/^MASTER0_DEVICE="\([^"]*\)".*/\1/p' \
+            /opt/etherlab/etc/sysconfig/ethercat | head -n 1)
+        if [[ -z "$interface" ]]; then
+            log_error "未能从 EtherCAT 配置读取 MASTER0_DEVICE"
+            exit 1
+        fi
+        configure_systemd_service_for_interface "$interface"
+        disable_networkmanager "$interface"
+        log_success "开机自动绑定修复已安装，目标网卡: $interface"
+        exit 0
+    fi
     
     # 仅重新编译模块
     if [[ "$rebuild_only" == true ]]; then
@@ -525,6 +585,7 @@ main() {
     
     # 执行配置流程
     configure_ethercat_interface "$interface"
+    configure_systemd_service_for_interface "$interface"
     disable_networkmanager "$interface"
     rebuild_kernel_modules
     unload_kernel_modules
