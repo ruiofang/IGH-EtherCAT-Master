@@ -107,10 +107,14 @@ check_service_status() {
     if systemctl list-unit-files | grep -q "ethercat.service"; then
         log_success "systemd服务文件存在"
         
-        if systemctl is-enabled --quiet ethercat 2>/dev/null; then
+        local unit_state
+        unit_state=$(systemctl is-enabled ethercat 2>/dev/null || true)
+        if [[ "$unit_state" == "enabled" ]]; then
             log_success "服务已启用"
+        elif [[ "$unit_state" == "static" ]] && systemctl is-enabled --quiet ethercat-monitor.service 2>/dev/null; then
+            log_success "服务由 MAC 地址恢复监视器自动启动"
         else
-            log_warning "服务未启用"
+            log_warning "服务未启用，且未检测到 udev 自动启动规则"
         fi
         
         if systemctl is-active --quiet ethercat 2>/dev/null; then
@@ -125,6 +129,16 @@ check_service_status() {
         fi
     else
         log_error "systemd服务文件不存在"
+    fi
+
+    if systemctl is-enabled --quiet ethercat-monitor.service 2>/dev/null; then
+        if systemctl is-active --quiet ethercat-monitor.service 2>/dev/null; then
+            log_success "网卡重连恢复监视器正在运行"
+        else
+            log_warning "网卡重连恢复监视器已启用但未运行"
+        fi
+    else
+        log_warning "未启用网卡重连恢复监视器"
     fi
     
     # 检查传统init脚本
@@ -173,6 +187,12 @@ check_configuration() {
     else
         log_warning "udev规则不存在: /etc/udev/rules.d/99-ethercat.rules"
     fi
+
+    if systemctl is-enabled --quiet ethercat-monitor.service 2>/dev/null; then
+        log_success "基于 MAC 的网卡重连恢复监视器已启用"
+    else
+        log_warning "未启用基于 MAC 的网卡重连恢复监视器"
+    fi
 }
 
 # 检查网络接口
@@ -185,7 +205,8 @@ check_network_interfaces() {
     
     # 检查配置的接口
     if [[ -f "/etc/sysconfig/ethercat" ]]; then
-        local device=$(grep "^MASTER0_DEVICE=" /etc/sysconfig/ethercat 2>/dev/null | cut -d'=' -f2 | tr -d '"')
+        local device
+        device=$(sed -n 's/^MASTER0_DEVICE="\([^"]*\)".*/\1/p' /etc/sysconfig/ethercat | head -n 1)
         if [[ -n "$device" ]]; then
             log_info "配置的主接口: $device"
             
@@ -196,11 +217,13 @@ check_network_interfaces() {
                 local status=$(ip link show "$device" | grep -o "state [A-Z]*" | cut -d' ' -f2)
                 log_info "接口状态: $status"
                 
-                # 检查是否被EtherCAT占用
-                if [[ -d "/sys/class/net/$device/master" ]]; then
-                    log_success "接口已被EtherCAT主站占用"
+                # generic 驱动不会创建网络 bridge master 目录；以字符设备和
+                # 主站实际输出判断绑定状态。
+                if [[ -c "/dev/EtherCAT0" ]] && command -v ethercat >/dev/null 2>&1 \
+                    && ethercat master 2>/dev/null | grep -q "(attached)"; then
+                    log_success "接口已被 EtherCAT 主站绑定"
                 else
-                    log_warning "接口未被EtherCAT主站占用"
+                    log_warning "接口尚未被 EtherCAT 主站绑定"
                 fi
             else
                 log_error "配置的接口 $device 不存在"

@@ -435,38 +435,74 @@ configure_kernel_module() {
 # 请根据您的网卡型号取消相应行的注释
 EOF
     
-    # 为指定网卡生成 systemd 服务。不能只依赖 network.target：USB 网卡等
-    # 设备常在该 target 之后才完成枚举，导致首次启动时找不到接口。
-    local device_unit
-    device_unit="$(systemd-escape -p --suffix=device "/sys/class/net/$SELECTED_INTERFACE")"
+    # 自动恢复使用网卡 MAC，而不是会随 USB 重新枚举而变化的接口名称。
+    local interface_mac script_dir resolver_source
+    interface_mac="$(tr '[:upper:]' '[:lower:]' < "/sys/class/net/$SELECTED_INTERFACE/address")"
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    resolver_source="$script_dir/ethercat_interface_resolver.sh"
+    [[ -f "$resolver_source" ]] || resolver_source="$PWD/ethercat_interface_resolver.sh"
+    [[ -f "$resolver_source" ]] || { log_error "找不到 ethercat_interface_resolver.sh"; exit 1; }
+    install -D -m 0755 "$resolver_source" \
+        /usr/local/libexec/ethercat-interface-resolver
 
-    # 创建systemd服务文件
     cat > /etc/systemd/system/ethercat.service << EOF
 [Unit]
 Description=EtherCAT Master Service
-Wants=network-online.target
-After=network-online.target $device_unit
-BindsTo=$device_unit
 StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
-ExecStartPre=/usr/bin/test -e /sys/class/net/$SELECTED_INTERFACE
+ExecStartPre=/usr/local/libexec/ethercat-interface-resolver $interface_mac /opt/etherlab/etc/sysconfig/ethercat --apply
 ExecStart=/etc/init.d/ethercat start
 ExecStop=/etc/init.d/ethercat stop
 RemainAfterExit=yes
 Restart=on-failure
 RestartSec=5
 
+EOF
+
+    # 监视器每 2 秒以 MAC 查找网卡。网卡重插并被临时命名为 eth0 时也能
+    # 正确恢复；它是独立后台服务，不会等待或阻塞系统启动。
+    cat > /etc/systemd/system/ethercat-monitor.service << EOF
+[Unit]
+Description=EtherCAT interface recovery monitor
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'while :; do if /usr/local/libexec/ethercat-interface-resolver $interface_mac /opt/etherlab/etc/sysconfig/ethercat >/dev/null; then /usr/bin/systemctl is-active --quiet ethercat.service || /usr/bin/systemctl start ethercat.service; else /usr/bin/systemctl is-active --quiet ethercat.service && /usr/bin/systemctl stop ethercat.service || true; fi; sleep 2; done'
+Restart=always
+RestartSec=2
+
 [Install]
 WantedBy=multi-user.target
 EOF
-    
+
     # 复制初始化脚本
     cp /opt/etherlab/etc/init.d/ethercat /etc/init.d/
     chmod +x /etc/init.d/ethercat
 
+    # 防止 NetworkManager 在重启后重新接管 EtherCAT 专用网卡。
+    mkdir -p /etc/NetworkManager/conf.d
+    rm -f /etc/NetworkManager/conf.d/99-ethercat-release.conf
+    cat > /etc/NetworkManager/conf.d/99-ethercat.conf << EOF
+[keyfile]
+unmanaged-devices=interface-name:$SELECTED_INTERFACE,interface-name:ecdbgm*
+EOF
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        nmcli device set "$SELECTED_INTERFACE" managed no 2>/dev/null || true
+        systemctl reload NetworkManager 2>/dev/null || true
+    fi
+
+    systemctl disable --now ethercat.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/ethercat.timer
+    systemctl disable --now ethercat.path 2>/dev/null || true
+    rm -f /etc/systemd/system/ethercat.path
+    rm -f /etc/udev/rules.d/80-ethercat-autostart.rules
     systemctl daemon-reload
+    systemctl disable ethercat.service 2>/dev/null || true
+    systemctl enable --now ethercat-monitor.service
+    systemctl restart ethercat-monitor.service
     
     log_success "内核模块配置完成"
 }
@@ -590,6 +626,15 @@ create_user() {
     # 创建工作目录
     mkdir -p /var/lib/ethercat
     chown ethercat:ethercat /var/lib/ethercat
+
+    # 允许发起 sudo 的普通用户访问 /dev/EtherCAT*；不使用全局可写权限。
+    local login_user="${SUDO_USER:-}"
+    if [[ -n "$login_user" && "$login_user" != "root" ]] \
+        && getent passwd "$login_user" >/dev/null \
+        && ! id -nG "$login_user" | tr ' ' '\n' | grep -qx ethercat; then
+        usermod -aG ethercat "$login_user"
+        log_info "已将用户 $login_user 加入 ethercat 组；重新登录后权限生效"
+    fi
     
     log_success "用户和组创建完成"
 }
@@ -613,7 +658,17 @@ set_permissions() {
     fi
     
     # 设置udev规则
-    if [[ -n "$rules_file" ]]; then
+    local login_user="${SUDO_USER:-}"
+    if [[ -n "$login_user" && "$login_user" != "root" ]] \
+        && getent passwd "$login_user" >/dev/null; then
+        # 新增组成员的当前 shell 不会立即获得新组。指定 sudo 发起者为设备
+        # 所有者可让首次安装后的当前终端立即访问，同时仍保持 0660 权限。
+        cat > "$target_rules" << EOF
+# EtherCAT 设备访问权限规则（由部署脚本生成）
+KERNEL=="EtherCAT[0-9]*", OWNER="$login_user", GROUP="ethercat", MODE="0660", TAG+="uaccess"
+EOF
+        log_success "已为用户 $login_user 配置 EtherCAT 设备访问权限"
+    elif [[ -n "$rules_file" ]]; then
         log_info "使用现有的udev规则文件..."
         cp "$rules_file" "$target_rules"
         chmod 644 "$target_rules"
@@ -623,15 +678,23 @@ set_permissions() {
         log_info "未找到现有规则文件，创建默认udev规则..."
         cat > "$target_rules" << EOF
 # EtherCAT Master设备权限规则
-KERNEL=="EtherCAT[0-9]*", MODE="0666", GROUP="ethercat"
+KERNEL=="EtherCAT[0-9]*", MODE="0660", GROUP="ethercat", TAG+="uaccess"
 EOF
         chmod 644 "$target_rules"
         chown root:root "$target_rules"
         log_success "已创建默认udev规则文件"
     fi
+
+    chmod 644 "$target_rules"
+    chown root:root "$target_rules"
     
     # 重新加载udev规则
     udevadm control --reload-rules
+    # 对已存在的主站设备立即应用 uaccess ACL；设备稍后创建时 udev 会自动应用。
+    if [[ -e "/dev/EtherCAT0" ]]; then
+        udevadm trigger --name-match=EtherCAT0
+        udevadm settle
+    fi
     log_info "已重新加载udev规则"
     
     # 设置目录权限
@@ -648,13 +711,23 @@ start_service() {
     # 重新加载systemd
     systemctl daemon-reload
     
-    # 启用服务
-    systemctl enable ethercat.service
+    # 服务由基于 MAC 的监视器在目标网卡出现时启动，不在开机路径中等待。
+    systemctl disable --now ethercat.timer 2>/dev/null || true
+    systemctl disable ethercat.service 2>/dev/null || true
+    systemctl enable --now ethercat-monitor.service
     
-    # 检查是否可以启动（不实际启动，因为可能没有EtherCAT设备）
-    log_warning "注意: 请在启动服务前修改 /etc/sysconfig/ethercat 中的网卡配置"
-    log_info "配置完成后，使用以下命令启动服务:"
-    log_info "  systemctl start ethercat"
+    # 用户刚刚选择的接口已存在，立即启动以创建 /dev/EtherCAT0；后续重启和
+    # 热插拔仍由 udev 规则负责，不会影响系统开机路径。
+    if systemctl start ethercat.service; then
+        log_success "EtherCAT 主站已启动"
+    else
+        log_warning "EtherCAT 主站未能立即启动；网卡重新枚举时会自动重试"
+        journalctl -u ethercat.service -n 20 --no-pager || true
+    fi
+
+    log_info "EtherCAT 将在网卡枚举完成后自动加载，不会阻塞开机"
+    log_info "如需手动重新启动，使用以下命令:"
+    log_info "  systemctl restart ethercat"
     log_info "  systemctl status ethercat"
     
     log_success "服务配置完成"

@@ -8,6 +8,9 @@
 
 set -e  # 遇到错误立即退出
 
+# 在脚本启动时解析真实目录；后续模块构建可能切换工作目录。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -55,6 +58,17 @@ check_installation() {
     log_success "EtherCAT Master安装检查通过"
 }
 
+# 允许运行 sudo 的普通用户读取 /dev/EtherCAT*；新组成员资格需重新登录后生效。
+grant_invoking_user_access() {
+    local login_user="${SUDO_USER:-}"
+    if [[ -n "$login_user" && "$login_user" != "root" ]] \
+        && getent passwd "$login_user" >/dev/null \
+        && ! id -nG "$login_user" | tr ' ' '\n' | grep -qx ethercat; then
+        usermod -aG ethercat "$login_user"
+        log_info "已将用户 $login_user 加入 ethercat 组；重新登录后权限生效"
+    fi
+}
+
 # 获取接口类型提示
 interface_hint() {
     local iface="$1"
@@ -82,6 +96,43 @@ is_default_gateway_interface() {
     local gw_iface
     gw_iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
     [[ "$gw_iface" == "$iface" ]]
+}
+
+interface_mac_address() {
+    local interface="$1"
+    local hex
+
+    if [[ -r "/sys/class/net/$interface/address" ]]; then
+        tr '[:upper:]' '[:lower:]' < "/sys/class/net/$interface/address"
+        return 0
+    fi
+    if [[ "$interface" =~ ^enx([0-9A-Fa-f]{12})$ ]]; then
+        hex="${BASH_REMATCH[1],,}"
+        printf '%s:%s:%s:%s:%s:%s\n' "${hex:0:2}" "${hex:2:2}" "${hex:4:2}" \
+            "${hex:6:2}" "${hex:8:2}" "${hex:10:2}"
+        return 0
+    fi
+    log_error "无法获取接口 $interface 的 MAC 地址；请在网卡已连接时运行"
+    return 1
+}
+
+# 脚本可能被从 /usr/src/ethercat、软链接或项目目录调用；解析器始终从
+# 实际可用的位置安装，避免绑定流程在重建模块后因辅助脚本路径错误中断。
+install_interface_resolver() {
+    local candidate
+
+    for candidate in \
+        "$SCRIPT_DIR/ethercat_interface_resolver.sh" \
+        "$PWD/ethercat_interface_resolver.sh" \
+        "/opt/etherlab/libexec/ethercat-interface-resolver"; do
+        if [[ -f "$candidate" ]]; then
+            install -D -m 0755 "$candidate" /usr/local/libexec/ethercat-interface-resolver
+            return 0
+        fi
+    done
+
+    log_error "找不到 ethercat_interface_resolver.sh；请从完整工具包目录运行此脚本"
+    return 1
 }
 
 # 收集接口信息到并列数组
@@ -212,40 +263,57 @@ configure_ethercat_interface() {
     fi
 }
 
-# 让服务在目标网卡实际出现在 /sys/class/net 后再启动。
-# 特别是 USB 网卡在 network.target 之后才枚举时，旧服务会在开机时失败，
-# 此处的失败重试可在网卡出现后自动创建 EtherCAT0。
+# 通过持久 MAC 地址识别目标网卡，避免 USB 网卡重插时临时接口名称变化。
+# 监视器在后台检查，不会因网卡缺失而阻塞系统启动。
 configure_systemd_service_for_interface() {
     local interface="$1"
-    local device_unit
+    local interface_mac
 
-    device_unit="$(systemd-escape -p --suffix=device "/sys/class/net/$interface")"
-    log_info "正在配置开机网卡等待和自动重试..."
+    interface_mac="$(interface_mac_address "$interface")"
+    install_interface_resolver
+    log_info "正在配置非阻塞开机和网卡热插拔自动加载..."
 
     cat > /etc/systemd/system/ethercat.service << EOF
 [Unit]
 Description=EtherCAT Master Service
-Wants=network-online.target
-After=network-online.target $device_unit
-BindsTo=$device_unit
 StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
-ExecStartPre=/usr/bin/test -e /sys/class/net/$interface
+ExecStartPre=/usr/local/libexec/ethercat-interface-resolver $interface_mac /opt/etherlab/etc/sysconfig/ethercat --apply
 ExecStart=/etc/init.d/ethercat start
 ExecStop=/etc/init.d/ethercat stop
 RemainAfterExit=yes
 Restart=on-failure
 RestartSec=5
 
+EOF
+
+    cat > /etc/systemd/system/ethercat-monitor.service << EOF
+[Unit]
+Description=EtherCAT interface recovery monitor
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'while :; do if /usr/local/libexec/ethercat-interface-resolver $interface_mac /opt/etherlab/etc/sysconfig/ethercat >/dev/null; then /usr/bin/systemctl is-active --quiet ethercat.service || /usr/bin/systemctl start ethercat.service; else /usr/bin/systemctl is-active --quiet ethercat.service && /usr/bin/systemctl stop ethercat.service || true; fi; sleep 2; done'
+Restart=always
+RestartSec=2
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
+    systemctl disable --now ethercat.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/ethercat.timer
+    systemctl disable --now ethercat.path 2>/dev/null || true
+    rm -f /etc/systemd/system/ethercat.path
+    rm -f /etc/udev/rules.d/80-ethercat-autostart.rules
     systemctl daemon-reload
-    systemctl enable ethercat.service >/dev/null
-    log_success "已设置服务等待网卡 $interface；网卡延迟出现时每 5 秒自动重试"
+    systemctl disable ethercat.service 2>/dev/null || true
+    systemctl enable --now ethercat-monitor.service >/dev/null
+    systemctl restart ethercat-monitor.service
+    log_success "已设置基于 MAC 的自动加载；网卡重命名与重插均可恢复"
 }
 
 # 停止NetworkManager对指定网卡的管理
@@ -255,21 +323,27 @@ disable_networkmanager() {
     # 无论 NetworkManager 当前是否已运行，都写入持久化配置，确保重启后不会
     # 抢占 EtherCAT 专用接口。
     mkdir -p /etc/NetworkManager/conf.d
+    rm -f /etc/NetworkManager/conf.d/99-ethercat-release.conf
     cat > /etc/NetworkManager/conf.d/99-ethercat.conf << EOF
 [keyfile]
-unmanaged-devices=interface-name:$interface
+# ecdbgm* 是 EtherCAT 主站创建的内部调试网卡，不得由 NetworkManager
+# 自动建立 DHCP 连接，否则会产生多余的“有线连接”并干扰主站通信。
+unmanaged-devices=interface-name:$interface,interface-name:ecdbgm*
 EOF
 
     if systemctl is-active --quiet NetworkManager 2>/dev/null; then
         log_info "检测到NetworkManager，正在禁用对 $interface 的管理..."
-        
-        # 设置网卡为非托管状态
+
+        # 先释放可能残留的普通网络连接，再应用持久规则。
+        nmcli device disconnect "$interface" 2>/dev/null || true
         nmcli device set "$interface" managed no 2>/dev/null || true
-        
-        # 重新加载NetworkManager配置
         systemctl reload NetworkManager 2>/dev/null || true
-        
-        log_success "已禁用NetworkManager对 $interface 的管理"
+        if [[ "$(nmcli -g GENERAL.NM-MANAGED device show "$interface" 2>/dev/null || true)" =~ ^(no|否)$ ]]; then
+            log_success "已禁用NetworkManager对 $interface 的管理"
+        else
+            log_error "NetworkManager 仍在管理 $interface"
+            return 1
+        fi
     fi
 }
 
@@ -284,11 +358,9 @@ rebuild_kernel_modules() {
         exit 1
     fi
     
-    cd "$build_dir"
-    
     # 重新编译内核模块
-    make modules
-    make modules_install
+    make -C "$build_dir" modules
+    make -C "$build_dir" modules_install
     
     # 更新模块依赖
     depmod -a
@@ -322,9 +394,31 @@ unload_kernel_modules() {
     fi
 }
 
+# 重新绑定期间暂停自动恢复，避免其在模块重建或卸载过程中抢先启动主站。
+pause_recovery_monitor() {
+    if systemctl is-active --quiet ethercat-monitor.service 2>/dev/null; then
+        log_info "暂时停止 EtherCAT 自动恢复监视器..."
+        systemctl stop ethercat-monitor.service
+    fi
+}
+
 # 启动EtherCAT服务
+ethercat_slave_identity_available() {
+    local ec_bin="$1" scan
+    scan="$($ec_bin slaves -v 2>/dev/null || true)"
+    grep -qE 'Vendor Id:[[:space:]]+0x0*[1-9a-fA-F][0-9a-fA-F]*' <<< "$scan" \
+        && grep -qE 'Product code:[[:space:]]+0x0*[1-9a-fA-F][0-9a-fA-F]*' <<< "$scan"
+}
+
 start_ethercat_service() {
     log_info "正在启动EtherCAT服务..."
+    local ec_bin=""
+
+    if command -v ethercat >/dev/null 2>&1; then
+        ec_bin="ethercat"
+    elif [[ -x "/opt/etherlab/bin/ethercat" ]]; then
+        ec_bin="/opt/etherlab/bin/ethercat"
+    fi
     
     # 重新加载systemd配置
     systemctl daemon-reload
@@ -341,8 +435,7 @@ start_ethercat_service() {
         return 1
     fi
     
-    # 等待服务完全就绪
-    sleep 3
+    # systemctl restart 会等待 oneshot 服务完成，此时应已可立即检查设备。
     if systemctl is-active --quiet ethercat; then
         log_success "EtherCAT服务运行正常"
     else
@@ -355,6 +448,12 @@ start_ethercat_service() {
     else
         log_warning "未发现 /dev/EtherCAT0，模块可能未正确绑定到网卡 MAC"
         log_info "检查 modprobe 参数: $(grep -h '^options ec_master' /etc/modprobe.d/*.conf 2>/dev/null || echo '（无）')"
+    fi
+
+    # 身份读取由主站后台持续扫描；不能在此处反复重启服务，否则会中断
+    # 正在进行的扫描并使重新绑定流程不必要地失败。
+    if [[ -n "$ec_bin" ]] && ! ethercat_slave_identity_available "$ec_bin"; then
+        log_warning "从站 SII 身份尚未读取完成；主站将继续后台扫描，不重启服务"
     fi
 }
 
@@ -380,7 +479,6 @@ verify_ethercat() {
         log_warning "EtherCAT 设备文件不存在: /dev/EtherCAT0"
     fi
 
-    sleep 1
     if [[ -n "$ec_bin" ]] && $ec_bin master >/dev/null 2>&1; then
         log_success "EtherCAT 主站通信正常"
         echo ""
@@ -529,6 +627,7 @@ main() {
     
     check_root
     check_installation
+    grant_invoking_user_access
 
     # 从现有配置读取接口名称。此模式不要求 USB 网卡已经被系统枚举，
     # 因而可用于修复“开机过早启动导致接口不存在”的系统。
@@ -584,11 +683,12 @@ main() {
     fi
     
     # 执行配置流程
+    pause_recovery_monitor
     configure_ethercat_interface "$interface"
-    configure_systemd_service_for_interface "$interface"
     disable_networkmanager "$interface"
     rebuild_kernel_modules
     unload_kernel_modules
+    configure_systemd_service_for_interface "$interface"
     start_ethercat_service
     verify_ethercat
     show_configuration_summary "$interface"

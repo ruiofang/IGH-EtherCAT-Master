@@ -3,6 +3,10 @@
 # IGH EtherCAT Master 工具包验证脚本
 # 检查所有必需文件是否存在且格式正确
 
+set -u
+
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 颜色定义
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -19,7 +23,9 @@ required_files=(
     "uninstall_igh_ethercat.sh" 
     "diagnose_ethercat.sh"
     "setup_ethercat_network.sh"
-    "quick_start_ethercat.sh"
+    "restore_network.sh"
+    "ethercat_interface_resolver.sh"
+    "99-ethercat.rules"
     "ethercat.conf.template"
     "README.md"
 )
@@ -49,7 +55,7 @@ echo ""
 
 # 检查脚本语法
 echo "检查脚本语法..."
-for script in deploy_igh_ethercat.sh uninstall_igh_ethercat.sh diagnose_ethercat.sh setup_ethercat_network.sh quick_start_ethercat.sh; do
+for script in deploy_igh_ethercat.sh uninstall_igh_ethercat.sh diagnose_ethercat.sh setup_ethercat_network.sh restore_network.sh ethercat_interface_resolver.sh; do
     if [[ -f "$script" ]]; then
         if bash -n "$script" 2>/dev/null; then
             echo -e "${GREEN}✓${NC} $script 语法正确"
@@ -68,13 +74,14 @@ if [[ "$all_ok" == true ]]; then
     echo "使用说明:"
     echo "1. 运行部署脚本: sudo ./deploy_igh_ethercat.sh"
     echo "2. 配置网络接口: sudo ./setup_ethercat_network.sh"
-    echo "3. 快速启动: sudo ./quick_start_ethercat.sh"
-    echo "4. 运行诊断: sudo ./diagnose_ethercat.sh"
+    echo "3. 运行诊断: sudo ./diagnose_ethercat.sh"
+    echo "4. 恢复普通网络: sudo ./restore_network.sh --release-ethercat"
     echo ""
     echo "详细说明请查看 README.md 文件"
 else
     echo -e "${RED}✗ 工具包验证失败！${NC}"
     echo "请检查缺失的文件或修复语法错误"
+    exit 1
 fi
 
 echo ""
