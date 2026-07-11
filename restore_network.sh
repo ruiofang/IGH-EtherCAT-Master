@@ -50,6 +50,10 @@ configured_ethercat_interface() {
 
 interface_mac_address() {
     local iface="$1"
+    if [[ "$iface" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        printf '%s\n' "${iface,,}"
+        return 0
+    fi
     [[ -r "/sys/class/net/$iface/address" ]] || return 0
     tr '[:upper:]' '[:lower:]' < "/sys/class/net/$iface/address"
 }

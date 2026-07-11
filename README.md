@@ -38,7 +38,7 @@ EtherCAT 不依赖图形界面、`network-online.target` 或固定延时。
 - `ethercat-monitor.service` 每 2 秒按网卡 MAC 做一次轻量状态检查，确保 USB 网卡重插、临时命名或重命名后仍会自动恢复 `ethercat.service`。
 - 接口不存在时，不会创建等待任务，也不会影响系统开机。
 - 接口拔出时，服务随设备停止。
-- 接口重新接入时，udev 立即再次启动服务。
+- 接口重新接入时，监视器会在约 2 秒内再次启动服务。
 
 检查状态：
 

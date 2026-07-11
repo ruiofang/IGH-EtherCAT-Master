@@ -102,6 +102,10 @@ interface_mac_address() {
     local interface="$1"
     local hex
 
+    if [[ "$interface" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        printf '%s\n' "${interface,,}"
+        return 0
+    fi
     if [[ -r "/sys/class/net/$interface/address" ]]; then
         tr '[:upper:]' '[:lower:]' < "/sys/class/net/$interface/address"
         return 0
@@ -112,7 +116,7 @@ interface_mac_address() {
             "${hex:6:2}" "${hex:8:2}" "${hex:10:2}"
         return 0
     fi
-    log_error "无法获取接口 $interface 的 MAC 地址；请在网卡已连接时运行"
+    log_error "无法获取接口 $interface 的 MAC 地址；请在网卡已连接时运行，或将 MASTER0_DEVICE 配置为 MAC 地址"
     return 1
 }
 
@@ -146,6 +150,7 @@ collect_interfaces() {
         if [[ $line =~ ^[0-9]+:\ ([^:@]+)[@:]? ]]; then
             iface="${BASH_REMATCH[1]}"
             [[ "$iface" == "lo" ]] && continue
+            [[ "$iface" =~ ^ecdbgm ]] && continue
 
             ip_addr=$(ip -o -4 addr show "$iface" 2>/dev/null | awk '{print $4}' | head -1)
             link_state=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || echo "unknown")
@@ -319,16 +324,18 @@ EOF
 # 停止NetworkManager对指定网卡的管理
 disable_networkmanager() {
     local interface="$1"
+    local interface_mac=""
+    interface_mac="$(interface_mac_address "$interface" 2>/dev/null || true)"
     
     # 无论 NetworkManager 当前是否已运行，都写入持久化配置，确保重启后不会
-    # 抢占 EtherCAT 专用接口。
+    # 抢占 EtherCAT 专用接口。USB 网卡可能重插后改名，所以同时按 MAC 忽略。
     mkdir -p /etc/NetworkManager/conf.d
     rm -f /etc/NetworkManager/conf.d/99-ethercat-release.conf
     cat > /etc/NetworkManager/conf.d/99-ethercat.conf << EOF
 [keyfile]
 # ecdbgm* 是 EtherCAT 主站创建的内部调试网卡，不得由 NetworkManager
 # 自动建立 DHCP 连接，否则会产生多余的“有线连接”并干扰主站通信。
-unmanaged-devices=interface-name:$interface,interface-name:ecdbgm*
+unmanaged-devices=interface-name:$interface${interface_mac:+,mac:$interface_mac},interface-name:ecdbgm*
 EOF
 
     if systemctl is-active --quiet NetworkManager 2>/dev/null; then
@@ -640,6 +647,7 @@ main() {
         fi
         configure_systemd_service_for_interface "$interface"
         disable_networkmanager "$interface"
+        systemctl restart ethercat
         log_success "开机自动绑定修复已安装，目标网卡: $interface"
         exit 0
     fi

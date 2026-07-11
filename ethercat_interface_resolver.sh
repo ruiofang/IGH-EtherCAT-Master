@@ -19,12 +19,14 @@ apply=false
 interface=""
 for net_path in /sys/class/net/*; do
     [ -r "$net_path/address" ] || continue
-    case "$(basename "$net_path")" in
+    iface=$(basename "$net_path")
+    case "$iface" in
         ecdbgm*) continue ;;
     esac
+    [ -e "$net_path/device" ] || continue
     current_mac=$(tr '[:upper:]' '[:lower:]' < "$net_path/address")
     if [ "$current_mac" = "$expected_mac" ]; then
-        interface=$(basename "$net_path")
+        interface=$iface
         break
     fi
 done

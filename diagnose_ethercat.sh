@@ -106,6 +106,11 @@ check_service_status() {
     # 检查systemd服务
     if systemctl list-unit-files | grep -q "ethercat.service"; then
         log_success "systemd服务文件存在"
+        local unit_content
+        unit_content=$(systemctl cat ethercat --no-pager 2>/dev/null || true)
+        if grep -q 'ExecStart=/opt/etherlab/' <<< "$unit_content" && [[ ! -x "/opt/etherlab/sbin/ethercatctl" ]]; then
+            log_error "systemd 服务指向 /opt/etherlab，但 ethercatctl 不存在；安装可能已被移除或不完整"
+        fi
         
         local unit_state
         unit_state=$(systemctl is-enabled ethercat 2>/dev/null || true)
@@ -166,7 +171,7 @@ check_configuration() {
         echo ""
         log_info "当前配置:"
         while IFS= read -r line; do
-            if [[ "$line" =~ ^[A-Z_]+=.*$ ]] && [[ ! "$line" =~ ^#.*$ ]]; then
+            if [[ "$line" =~ ^[A-Z0-9_]+=.*$ ]] && [[ ! "$line" =~ ^#.*$ ]]; then
                 echo "  $line"
             fi
         done < /etc/sysconfig/ethercat
@@ -234,6 +239,136 @@ check_network_interfaces() {
     fi
 }
 
+check_networkmanager_binding() {
+    log_section "检查 NetworkManager 专用网卡规则"
+
+    local config="/etc/sysconfig/ethercat"
+    local nm_config="/etc/NetworkManager/conf.d/99-ethercat.conf"
+    local device device_mac same_mac_interfaces=() iface current_mac nm_rules
+
+    if [[ ! -f "$config" ]]; then
+        log_warning "EtherCAT 配置文件不存在，跳过 NetworkManager 规则检查"
+        return 0
+    fi
+
+    device=$(sed -n 's/^MASTER0_DEVICE="\([^"]*\)".*/\1/p' "$config" | head -n 1)
+    if [[ -z "$device" ]]; then
+        log_warning "未配置 MASTER0_DEVICE，跳过 NetworkManager 规则检查"
+        return 0
+    fi
+
+    if [[ -r "/sys/class/net/$device/address" ]]; then
+        device_mac=$(tr '[:upper:]' '[:lower:]' < "/sys/class/net/$device/address")
+    elif [[ "$device" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        device_mac="${device,,}"
+    else
+        log_warning "无法读取 $device 的 MAC，网卡可能未连接"
+        return 0
+    fi
+
+    log_info "目标网卡: $device ($device_mac)"
+
+    if [[ -f "$nm_config" ]]; then
+        nm_rules=$(grep -E '^unmanaged-devices=' "$nm_config" 2>/dev/null || true)
+        if grep -q "mac:$device_mac" <<< "$nm_rules"; then
+            log_success "NetworkManager 已按 MAC 忽略 EtherCAT USB 网卡"
+        else
+            log_warning "NetworkManager 规则未按 MAC 忽略目标网卡；USB 重插改名后可能被重新托管"
+        fi
+
+        if grep -q 'interface-name:ecdbgm\*' <<< "$nm_rules"; then
+            log_success "NetworkManager 已忽略 ecdbgm* 调试虚拟网卡"
+        else
+            log_warning "NetworkManager 规则未忽略 ecdbgm*，可能生成多余有线连接"
+        fi
+    else
+        log_warning "NetworkManager EtherCAT 规则不存在: $nm_config"
+    fi
+
+    for iface in /sys/class/net/*; do
+        iface="$(basename "$iface")"
+        [[ "$iface" == "lo" || ! -r "/sys/class/net/$iface/address" ]] && continue
+        current_mac=$(tr '[:upper:]' '[:lower:]' < "/sys/class/net/$iface/address")
+        [[ "$current_mac" == "$device_mac" ]] && same_mac_interfaces+=("$iface")
+    done
+
+    if [[ ${#same_mac_interfaces[@]} -gt 1 ]]; then
+        log_info "检测到同 MAC 接口: ${same_mac_interfaces[*]}"
+        if printf '%s\n' "${same_mac_interfaces[@]}" | grep -q '^ecdbgm'; then
+            log_success "ecdbgm* 是 EtherCAT 主站调试虚拟网卡，不能作为物理绑定接口"
+        else
+            log_warning "存在多个同 MAC 网络接口，请确认绑定的是物理网卡"
+        fi
+    fi
+}
+
+check_physical_link_quality() {
+    log_section "检查物理链路和 USB 网卡驱动"
+
+    local config="/etc/sysconfig/ethercat"
+    local device driver model link_info speed duplex autoneg link_detected
+
+    [[ -f "$config" ]] || { log_warning "EtherCAT 配置文件不存在，跳过链路质量检查"; return 0; }
+    device=$(sed -n 's/^MASTER0_DEVICE="\([^"]*\)".*/\1/p' "$config" | head -n 1)
+    [[ -n "$device" && -d "/sys/class/net/$device" ]] || { log_warning "目标网卡不在线，跳过链路质量检查"; return 0; }
+
+    driver=$(udevadm info -q property -p "/sys/class/net/$device" 2>/dev/null \
+        | awk -F= '/^ID_NET_DRIVER=/{print $2; exit}')
+    model=$(udevadm info -q property -p "/sys/class/net/$device" 2>/dev/null \
+        | awk -F= '/^ID_MODEL=/{print $2; exit}')
+    log_info "目标网卡驱动: ${driver:-未知} (${model:-未知型号})"
+
+    if command -v ethtool >/dev/null 2>&1; then
+        link_info=$(ethtool "$device" 2>/dev/null || true)
+        speed=$(awk -F': ' '/Speed:/{print $2; exit}' <<< "$link_info")
+        duplex=$(awk -F': ' '/Duplex:/{print $2; exit}' <<< "$link_info")
+        autoneg=$(awk -F': ' '/Auto-negotiation:/{print $2; exit}' <<< "$link_info")
+        link_detected=$(awk -F': ' '/Link detected:/{print $2; exit}' <<< "$link_info")
+        log_info "链路: speed=${speed:-未知}, duplex=${duplex:-未知}, autoneg=${autoneg:-未知}, link=${link_detected:-未知}"
+
+        if [[ "$duplex" == "Half" ]]; then
+            log_error "EtherCAT 链路处于半双工；这会导致 SII/AL 数据报超时和从站身份读 0"
+        fi
+    else
+        log_warning "未安装 ethtool，无法检查链路双工"
+    fi
+
+    if [[ "$driver" == "cdc_ncm" && "$model" =~ AX88179 ]]; then
+        log_warning "AX88179/AX88179A 当前使用 cdc_ncm 驱动；若链路被识别为半双工，建议更换原生 PCIe 网卡、RTL8153/r8152 USB 网卡，或安装可用的 ASIX 专用驱动"
+    fi
+}
+
+check_slave_sii_identity() {
+    log_section "检查从站 SII/EEPROM 身份数据"
+
+    if ! command -v ethercat >/dev/null 2>&1; then
+        log_warning "ethercat 命令不可用，跳过 SII 检查"
+        return 0
+    fi
+
+    local slave_output sii_sample nonzero_count
+    slave_output=$(ethercat slaves -v 2>/dev/null || true)
+    if [[ -z "$slave_output" ]]; then
+        log_warning "无法读取从站详细信息"
+        return 0
+    fi
+
+    if grep -q 'Vendor Id:[[:space:]]*0x0\{8\}' <<< "$slave_output" \
+        && grep -q 'Product code:[[:space:]]*0x0\{8\}' <<< "$slave_output"; then
+        log_error "从站 Vendor/Product 均为 0，主站未读到有效 SII 身份数据"
+        sii_sample=$(ethercat sii_read -p 0 2>/dev/null | head -c 64 | od -An -tx1 || true)
+        if [[ -n "$sii_sample" ]]; then
+            nonzero_count=$(tr ' ' '\n' <<< "$sii_sample" | grep -Eiv '^(|00)$' | wc -l)
+            log_info "SII 前 64 字节非零字节数: $nonzero_count"
+            if (( nonzero_count < 8 )); then
+                log_error "SII 内容基本为空；可能是从站 EEPROM 无效/损坏，或底层链路/驱动导致 EEPROM 读取失败"
+            fi
+        fi
+    else
+        log_success "从站 SII 身份数据非零"
+    fi
+}
+
 # 检查EtherCAT主站状态
 check_ethercat_master() {
     log_section "检查EtherCAT主站状态"
@@ -242,8 +377,17 @@ check_ethercat_master() {
         # 检查主站
         echo ""
         log_info "主站信息:"
-        if ethercat master 2>/dev/null; then
+        local master_output
+        master_output=$(ethercat master 2>/dev/null || true)
+        if [[ -n "$master_output" ]]; then
+            echo "$master_output"
             log_success "主站通信正常"
+            if grep -q 'Link:[[:space:]]*DOWN' <<< "$master_output"; then
+                log_warning "主站已绑定网卡，但物理链路为 DOWN；请检查网线、从站电源和 IN 口"
+            fi
+            if grep -q 'Slaves:[[:space:]]*0' <<< "$master_output"; then
+                log_warning "当前未扫描到从站"
+            fi
         else
             log_warning "无法获取主站信息，可能主站未启动或配置错误"
         fi
@@ -273,6 +417,7 @@ check_ethercat_master() {
 # 检查用户权限
 check_permissions() {
     log_section "检查用户权限"
+    local check_user="${SUDO_USER:-$USER}"
     
     # 检查ethercat用户和组
     if getent passwd ethercat > /dev/null 2>&1; then
@@ -287,12 +432,12 @@ check_permissions() {
         log_warning "ethercat组不存在"
     fi
     
-    # 检查当前用户权限
-    if groups | grep -q ethercat; then
-        log_success "当前用户属于ethercat组"
+    # 检查发起诊断的用户权限
+    if id -nG "$check_user" 2>/dev/null | tr ' ' '\n' | grep -qx ethercat; then
+        log_success "用户 $check_user 属于 ethercat 组"
     else
-        log_warning "当前用户不属于ethercat组"
-        log_info "运行以下命令将用户添加到ethercat组: sudo usermod -a -G ethercat \$USER"
+        log_warning "用户 $check_user 不属于 ethercat 组"
+        log_info "运行以下命令将用户添加到ethercat组: sudo usermod -a -G ethercat $check_user"
     fi
     
     # 检查设备文件权限
@@ -313,8 +458,8 @@ check_system_resources() {
     log_info "CPU核心数: $cpu_count"
     
     # 内存信息
-    local mem_total=$(free -h | awk '/^Mem:/ {print $2}')
-    local mem_available=$(free -h | awk '/^Mem:/ {print $7}')
+    local mem_total=$(free -h | awk '/^(Mem:|内存[:：])/ {print $2; exit}')
+    local mem_available=$(free -h | awk '/^(Mem:|内存[:：])/ {print $7; exit}')
     log_info "内存: 总计 $mem_total, 可用 $mem_available"
     
     # 负载信息
@@ -441,7 +586,10 @@ full_check() {
     check_service_status
     check_configuration
     check_network_interfaces
+    check_networkmanager_binding
+    check_physical_link_quality
     check_ethercat_master
+    check_slave_sii_identity
     check_permissions
     check_system_resources
 }

@@ -8,6 +8,9 @@
 
 set -e  # 遇到错误立即退出
 
+# 在脚本启动时解析真实目录；后续安装步骤会切换工作目录。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -110,6 +113,7 @@ select_network_interface() {
     while IFS= read -r line; do
         if [[ $line =~ ^[0-9]+:\ ([^:@]+)[@:]? ]]; then
             local iface="${BASH_REMATCH[1]}"
+            [[ "$iface" =~ ^ecdbgm ]] && continue
             if is_supported_ethercat_interface "$iface"; then
                 interfaces+=("$iface")
                 
@@ -285,14 +289,13 @@ download_source() {
     mkdir -p "$download_dir"
     
     # 首先检查当前目录或脚本所在目录是否存在压缩包
-    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local tarball_path=""
     
     if [[ -f "$current_dir/$tarball_name" ]]; then
         tarball_path="$current_dir/$tarball_name"
         log_info "在当前目录找到压缩包: $tarball_path"
-    elif [[ -f "$script_dir/$tarball_name" ]]; then
-        tarball_path="$script_dir/$tarball_name"
+    elif [[ -f "$SCRIPT_DIR/$tarball_name" ]]; then
+        tarball_path="$SCRIPT_DIR/$tarball_name"
         log_info "在脚本目录找到压缩包: $tarball_path"
     fi
     
@@ -436,10 +439,9 @@ configure_kernel_module() {
 EOF
     
     # 自动恢复使用网卡 MAC，而不是会随 USB 重新枚举而变化的接口名称。
-    local interface_mac script_dir resolver_source
+    local interface_mac resolver_source
     interface_mac="$(tr '[:upper:]' '[:lower:]' < "/sys/class/net/$SELECTED_INTERFACE/address")"
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    resolver_source="$script_dir/ethercat_interface_resolver.sh"
+    resolver_source="$SCRIPT_DIR/ethercat_interface_resolver.sh"
     [[ -f "$resolver_source" ]] || resolver_source="$PWD/ethercat_interface_resolver.sh"
     [[ -f "$resolver_source" ]] || { log_error "找不到 ethercat_interface_resolver.sh"; exit 1; }
     install -D -m 0755 "$resolver_source" \
@@ -487,7 +489,7 @@ EOF
     rm -f /etc/NetworkManager/conf.d/99-ethercat-release.conf
     cat > /etc/NetworkManager/conf.d/99-ethercat.conf << EOF
 [keyfile]
-unmanaged-devices=interface-name:$SELECTED_INTERFACE,interface-name:ecdbgm*
+unmanaged-devices=interface-name:$SELECTED_INTERFACE,mac:$interface_mac,interface-name:ecdbgm*
 EOF
     if systemctl is-active --quiet NetworkManager 2>/dev/null; then
         nmcli device set "$SELECTED_INTERFACE" managed no 2>/dev/null || true
@@ -517,15 +519,14 @@ configure_ethercat() {
     
     local config_file="/opt/etherlab/etc/sysconfig/ethercat"
     local current_dir=$(pwd)
-    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local template_file=""
     
     # 检查是否存在本地配置模板
     if [[ -f "$current_dir/ethercat.conf.template" ]]; then
         template_file="$current_dir/ethercat.conf.template"
         log_info "在当前目录找到配置模板: $template_file"
-    elif [[ -f "$script_dir/ethercat.conf.template" ]]; then
-        template_file="$script_dir/ethercat.conf.template"
+    elif [[ -f "$SCRIPT_DIR/ethercat.conf.template" ]]; then
+        template_file="$SCRIPT_DIR/ethercat.conf.template"
         log_info "在脚本目录找到配置模板: $template_file"
     fi
     
@@ -644,7 +645,6 @@ set_permissions() {
     log_info "正在设置文件权限..."
     
     local current_dir=$(pwd)
-    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local rules_file=""
     local target_rules="/etc/udev/rules.d/99-ethercat.rules"
     
@@ -652,8 +652,8 @@ set_permissions() {
     if [[ -f "$current_dir/99-ethercat.rules" ]]; then
         rules_file="$current_dir/99-ethercat.rules"
         log_info "在当前目录找到udev规则文件: $rules_file"
-    elif [[ -f "$script_dir/99-ethercat.rules" ]]; then
-        rules_file="$script_dir/99-ethercat.rules"
+    elif [[ -f "$SCRIPT_DIR/99-ethercat.rules" ]]; then
+        rules_file="$SCRIPT_DIR/99-ethercat.rules"
         log_info "在脚本目录找到udev规则文件: $rules_file"
     fi
     
